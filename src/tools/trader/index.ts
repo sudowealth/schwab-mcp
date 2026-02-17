@@ -186,12 +186,28 @@ Example market sell order:
 					symbol: leg.instrument.symbol,
 				})),
 			})
-			const order = await c.trader.orders.placeOrderForAccount({
-				pathParams: { accountNumber: p.accountNumber },
-				body: p as any, // Cast needed since we're using minimal schema
+			
+			// Create a custom endpoint that bypasses the SDK's over-specified bodySchema validation.
+			// The SDK's PlaceOrderRequestBody requires 30+ fields, but Schwab's API only needs a subset.
+			const placeOrderCustom = c.createEndpoint({
+				method: 'POST' as const,
+				path: '/trader/v1/accounts/{accountNumber}/orders',
+				pathSchema: z.object({ accountNumber: z.string() }),
+				bodySchema: MinimalPlaceOrderParams.omit({ accountNumber: true }), // Body doesn't need accountNumber
+				responseSchema: z.any(), // Accept any response (usually empty on success)
+				errorSchema: z.any(),
+				description: 'Place an order (minimal schema)',
+			})
+			
+			// Build the order body (without accountNumber which goes in path)
+			const { accountNumber, ...orderBody } = p
+			
+			const order = await placeOrderCustom({
+				pathParams: { accountNumber },
+				body: orderBody,
 			})
 			const displayMap = await buildAccountDisplayMap(c)
-			return scrubAccountIdentifiers(order, displayMap)
+			return scrubAccountIdentifiers(order ?? { success: true, message: 'Order placed successfully' }, displayMap)
 		},
 	}),
 	createToolSpec({
