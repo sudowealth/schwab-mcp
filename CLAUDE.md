@@ -214,3 +214,58 @@ The SDK's EnhancedTokenManager handles automatic refresh. If refresh token expir
 ## Token Migration
 
 Each OAuth flow creates a new `schwabUserId`. The grant's `encryptedProps` contains both `schwabUserId` and `clientId`, ensuring the DO can always find tokens after OAuth completes.
+
+---
+
+## Fixed: placeOrder Over-Specified Schema (Feb 2026)
+
+### The Problem
+
+The `@sudowealth/schwab-api` package's `PlaceOrderParams` schema requires ALL 30+ fields, including nonsensical ones like `filledQuantity`, `cancelTime`, `statusDescription`, etc. — fields that only make sense in a response, not a request.
+
+This caused placeOrder to fail with validation errors like:
+```
+'cancelTime': Required; 'filledQuantity': Required; 'remainingQuantity': Required; ...
+```
+
+### The Solution (Two Parts)
+
+**1. Minimal MCP Schema** (`src/tools/trader/index.ts`)
+
+Created `MinimalPlaceOrderParams` that only requires what Schwab's API actually needs:
+- **Required**: `accountNumber`, `orderType`, `session`, `duration`, `orderStrategyType`, `orderLegCollection`
+- **Optional**: `price` (for LIMIT), `stopPrice` (for STOP), plus tax/routing options
+
+**2. Bypass SDK Validation**
+
+The SDK's `placeOrderForAccount` method validates against `PlaceOrderRequestBody` before sending to Schwab. To bypass this, we create a custom endpoint:
+
+```typescript
+const placeOrderCustom = c.createEndpoint({
+    method: 'POST' as const,
+    path: '/trader/v1/accounts/{accountNumber}/orders',
+    pathSchema: z.object({ accountNumber: z.string() }),
+    bodySchema: MinimalPlaceOrderParams.omit({ accountNumber: true }),
+    responseSchema: z.any(),
+    errorSchema: z.any(),
+    description: 'Place an order (minimal schema)',
+})
+```
+
+This uses the SDK's `createEndpoint` to make a raw request with our minimal schema, bypassing the over-specified validation.
+
+### Example: Simple Market Sell Order
+
+```bash
+mcporter call schwab.placeOrder \
+  accountNumber='ACCOUNT_HASH' \
+  orderType='MARKET' \
+  session='NORMAL' \
+  duration='DAY' \
+  orderStrategyType='SINGLE' \
+  orderLegCollection='[{"instruction":"SELL","quantity":1,"instrument":{"symbol":"TLRY","assetType":"EQUITY"}}]'
+```
+
+### Note on replaceOrder
+
+The `replaceOrder` tool still uses the SDK's over-specified `ReplaceOrderParams`. If you need to fix that too, apply the same pattern: create a minimal schema and use `c.createEndpoint()` to bypass SDK validation.
