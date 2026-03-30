@@ -9,7 +9,7 @@ import {
 	type TokenData,
 } from '@sudowealth/schwab-api'
 import { DurableMCP } from 'workers-mcp'
-import { type ValidatedEnv } from '../types/env'
+import { type Env, type ValidatedEnv } from '../types/env'
 import { SchwabHandler, initializeSchwabAuthClient } from './auth'
 import { getConfig } from './config'
 import {
@@ -20,6 +20,8 @@ import {
 	ENVIRONMENTS,
 	CONTENT_TYPES,
 	APP_SERVER_NAME,
+	TOKEN_KEY_PREFIX,
+	TTL_31_DAYS,
 } from './shared/constants'
 import { makeKvTokenStore, type TokenIdentifiers } from './shared/kvTokenStore'
 import { logger, buildLogger, type PinoLogLevel } from './shared/log'
@@ -320,11 +322,128 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 	}
 }
 
-export default new OAuthProvider({
+const oauthProvider = new OAuthProvider({
 	apiRoute: API_ENDPOINTS.SSE,
 	apiHandler: MyMCP.mount(API_ENDPOINTS.SSE) as any, // Cast remains due to library typing
 	defaultHandler: SchwabHandler as any, // Cast remains
 	authorizeEndpoint: API_ENDPOINTS.AUTHORIZE,
 	tokenEndpoint: API_ENDPOINTS.TOKEN,
 	clientRegistrationEndpoint: API_ENDPOINTS.REGISTER,
+	// 30-day access tokens: all three clients (Claude Code, Claude Desktop, OpenClaw) share
+	// the same mcp-remote token file and race to refresh when the 1-hour default expires.
+	// Long-lived tokens eliminate concurrent refresh races almost entirely.
+	accessTokenTTL: 30 * 24 * 60 * 60, // 30 days
 })
+
+export default {
+	fetch: oauthProvider.fetch.bind(oauthProvider),
+
+	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+		const cronLogger = logger.child({ context: 'cron' })
+		cronLogger.info('Cron triggered', { cron: event.cron })
+
+		try {
+			const config = getConfig(env)
+			const kv = config.OAUTH_KV
+			const list = await kv.list({ prefix: TOKEN_KEY_PREFIX })
+
+			// Filter to simple token:id keys (not compound token:id:grant:hash keys)
+			const tokenKeys = list.keys.filter(k => {
+				const parts = k.name.replace(TOKEN_KEY_PREFIX, '').split(':')
+				return parts.length === 1
+			})
+
+			cronLogger.info('Token key inventory', {
+				total: list.keys.length,
+				simpleTokenKeys: tokenKeys.length,
+				keys: tokenKeys.map(k => ({
+					name: k.name.substring(0, 20) + '...',
+					kvExpiration: k.expiration
+						? `${((k.expiration - Date.now() / 1000) / 86400).toFixed(1)}d`
+						: 'none',
+				})),
+			})
+
+			if (tokenKeys.length === 0) {
+				cronLogger.error('No token keys found in KV — nothing to refresh. Re-auth required.')
+				return
+			}
+
+			// Pick the freshest token (highest expiration = most recently saved)
+			const sorted = tokenKeys.slice().sort((a, b) =>
+				(b.expiration ?? 0) - (a.expiration ?? 0)
+			)
+			const bestKey = sorted[0]
+			const tokenKey = bestKey.name
+
+			// Pre-refresh diagnostic: what's in this token right now?
+			const preRefreshToken = (await kv.get(tokenKey, 'json')) as TokenData | null
+			const accessTokenExpiry = preRefreshToken?.expiresAt
+				? new Date(preRefreshToken.expiresAt).toISOString()
+				: 'unknown'
+			const accessTokenAge = preRefreshToken?.expiresAt
+				? `${((Date.now() - preRefreshToken.expiresAt) / 60000).toFixed(0)}min ago`
+				: 'unknown'
+			cronLogger.info('Pre-refresh token state', {
+				key: tokenKey.substring(0, 20) + '...',
+				hasAccessToken: !!preRefreshToken?.accessToken,
+				hasRefreshToken: !!preRefreshToken?.refreshToken,
+				accessTokenExpiry,
+				accessTokenAge: preRefreshToken?.expiresAt && preRefreshToken.expiresAt < Date.now()
+					? `EXPIRED ${accessTokenAge}`
+					: `valid (expires ${accessTokenExpiry})`,
+			})
+
+			const loadToken = async (): Promise<TokenData | null> =>
+				(await kv.get(tokenKey, 'json')) as TokenData | null
+			const saveToken = async (data: TokenData): Promise<void> => {
+				await kv.put(tokenKey, JSON.stringify(data), { expirationTtl: TTL_31_DAYS })
+			}
+
+			const tokenManager = initializeSchwabAuthClient(
+				config, config.SCHWAB_REDIRECT_URI, loadToken, saveToken,
+			)
+			const success = await tokenManager.initialize()
+
+			if (success) {
+				// Verify the token was actually updated by reading it back
+				const postRefreshToken = (await kv.get(tokenKey, 'json')) as TokenData | null
+				const newExpiry = postRefreshToken?.expiresAt
+					? new Date(postRefreshToken.expiresAt).toISOString()
+					: 'unknown'
+				const tokenActuallyUpdated = postRefreshToken?.expiresAt !== preRefreshToken?.expiresAt
+
+				cronLogger.info('Token refresh succeeded', {
+					tokenUpdated: tokenActuallyUpdated,
+					newAccessTokenExpiry: newExpiry,
+					hasNewRefreshToken: !!postRefreshToken?.refreshToken,
+				})
+
+				if (!tokenActuallyUpdated) {
+					cronLogger.warn('Token was NOT updated despite initialize() returning true — access token may not have been expired yet')
+				}
+
+				// Cleanup: delete all OTHER simple token keys to prevent accumulation
+				const staleKeys = tokenKeys.filter(k => k.name !== tokenKey)
+				if (staleKeys.length > 0) {
+					cronLogger.info('Cleaning up stale token keys', { count: staleKeys.length })
+					for (const stale of staleKeys) {
+						try {
+							await kv.delete(stale.name)
+							cronLogger.info('Deleted stale key', { key: stale.name.substring(0, 20) + '...' })
+						} catch {
+							cronLogger.warn('Failed to delete stale key', { key: stale.name.substring(0, 20) + '...' })
+						}
+					}
+				}
+			} else {
+				cronLogger.error('TOKEN REFRESH FAILED — initialize() returned false. The Schwab refresh token is likely expired. Manual re-auth required: rm -rf ~/.mcp-auth/ && npx -y mcp-remote https://schwab-mcp-owais.owais-ce6.workers.dev/sse')
+			}
+		} catch (error) {
+			cronLogger.error('Cron failed with exception', {
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			})
+		}
+	},
+}

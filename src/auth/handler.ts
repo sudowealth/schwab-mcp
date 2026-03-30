@@ -6,11 +6,18 @@ import {
 	SchwabAuthError,
 	SchwabApiError,
 	type TokenData,
+	type SchwabApiClient,
 } from '@sudowealth/schwab-api'
 import { Hono } from 'hono'
-import { type Env } from '../../types/env'
+import { type Env, type ValidatedEnv } from '../../types/env'
 import { getConfig } from '../config'
-import { LOGGER_CONTEXTS, APP_SERVER_NAME } from '../shared/constants'
+import {
+	LOGGER_CONTEXTS,
+	APP_SERVER_NAME,
+	TOKEN_KEY_PREFIX,
+	TTL_31_DAYS,
+	ENVIRONMENTS,
+} from '../shared/constants'
 import { makeKvTokenStore } from '../shared/kvTokenStore'
 import { logger } from '../shared/log'
 import { initializeSchwabAuthClient, redirectToSchwab } from './client'
@@ -216,7 +223,12 @@ app.get('/callback', async (c) => {
 		// Initial token identifiers (before we get schwabUserId)
 		const getInitialTokenIds = () => ({ clientId: clientIdFromState })
 
+		// Capture token data as it's saved so we can re-use it for dual-key save below.
+		// We cannot re-load from KV after exchangeCode because Cloudflare KV has no
+		// read-after-write consistency — the get would return null immediately after the put.
+		let capturedTokenData: TokenData | null = null
 		const saveToken = async (tokenData: TokenData) => {
+			capturedTokenData = tokenData
 			await kvToken.save(getInitialTokenIds(), tokenData)
 		}
 
@@ -296,17 +308,18 @@ app.get('/callback', async (c) => {
 			return c.json(jsonResponse, errorInfo.status as any)
 		}
 
-		// Save token under BOTH clientId and schwabUserId keys
-		// This ensures any session can find the tokens
+		// Save token under BOTH clientId and schwabUserId keys.
+		// Use capturedTokenData from the saveToken callback — do NOT re-load from KV here.
+		// Cloudflare KV has no read-after-write consistency, so kv.get() immediately after
+		// kv.put() returns null, causing the dual-key save to be silently skipped.
+		// The DO always looks up tokens by schwabUserId first, so if only the clientId key
+		// exists, every subsequent connection fails with "Unauthorized".
 		try {
-			const currentTokenData = await kvToken.load({
-				clientId: clientIdFromState,
-			})
-			if (currentTokenData) {
-				// Save under schwabUserId key (primary)
-				await kvToken.save({ schwabUserId: userIdFromSchwab }, currentTokenData)
-				// ALSO keep under clientId key (for sessions without schwabUserId in props)
-				await kvToken.save({ clientId: clientIdFromState }, currentTokenData)
+			if (capturedTokenData) {
+				// Save under schwabUserId key (primary — what the DO looks up first)
+				await kvToken.save({ schwabUserId: userIdFromSchwab }, capturedTokenData)
+				// Save under clientId key (fallback for sessions without schwabUserId in props)
+				await kvToken.save({ clientId: clientIdFromState }, capturedTokenData)
 				oauthLogger.info('Token saved under both keys', {
 					clientIdKey: sanitizeKeyForLog(
 						kvToken.kvKey({ clientId: clientIdFromState }),
@@ -315,6 +328,32 @@ app.get('/callback', async (c) => {
 						kvToken.kvKey({ schwabUserId: userIdFromSchwab }),
 					),
 				})
+
+				// Clean up stale token keys from previous auth sessions
+				// This prevents accumulation that confuses the daily cron refresh
+				const kv = config.OAUTH_KV
+				const newKeys = new Set([
+					kvToken.kvKey({ schwabUserId: userIdFromSchwab }),
+					kvToken.kvKey({ clientId: clientIdFromState }),
+				])
+				try {
+					const allKeys = await kv.list({ prefix: TOKEN_KEY_PREFIX })
+					for (const key of allKeys.keys) {
+						const parts = key.name.replace(TOKEN_KEY_PREFIX, '').split(':')
+						if (parts.length === 1 && !newKeys.has(key.name)) {
+							await kv.delete(key.name)
+							oauthLogger.info('Cleaned up stale token key', {
+								key: sanitizeKeyForLog(key.name),
+							})
+						}
+					}
+				} catch (cleanupErr) {
+					oauthLogger.warn('Stale token cleanup failed (non-fatal)', {
+						error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+					})
+				}
+			} else {
+				oauthLogger.warn('capturedTokenData is null — token may not have been saved by exchangeCode')
 			}
 		} catch (migrationError) {
 			oauthLogger.warn(
@@ -398,6 +437,139 @@ app.get('/callback', async (c) => {
 		const jsonResponse = createJsonErrorResponse(mcpError, requestId, {})
 
 		return c.json(jsonResponse, errorInfo.status as any)
+	}
+})
+
+// ---------------------------------------------------------------------------
+// REST API — for the Python stock research pipeline
+// Auth: X-API-Key header (stored as worker secret SCHWAB_REST_API_KEY)
+// ---------------------------------------------------------------------------
+
+/**
+ * Loads an active Schwab API client by finding the first token in KV.
+ * Since there is only one user (Owais), we list token: keys and use the first.
+ */
+async function createRestClient(
+	kv: KVNamespace,
+	config: ValidatedEnv,
+): Promise<SchwabApiClient | null> {
+	const list = await kv.list({ prefix: TOKEN_KEY_PREFIX })
+	if (list.keys.length === 0) return null
+
+	// Prefer the key with the most recent expiration (DO refreshes schwabUserId key on every refresh).
+	// Keys with metadata.expiration set are sorted by that; otherwise take the longest name
+	// (schwabUserId correlIds are longer than mcp-remote clientIds).
+	const sortedKeys = list.keys.slice().sort((a, b) => {
+		const expA = (a.expiration ?? 0)
+		const expB = (b.expiration ?? 0)
+		if (expA !== expB) return expB - expA  // most recently set TTL first
+		return b.name.length - a.name.length   // longer key = schwabUserId
+	})
+	const bestKey = sortedKeys[0]
+	if (!bestKey) return null
+
+	const tokenKey = bestKey.name
+
+	const loadToken = async (): Promise<TokenData | null> => {
+		return (await kv.get(tokenKey, 'json')) as TokenData | null
+	}
+	const saveToken = async (data: TokenData): Promise<void> => {
+		await kv.put(tokenKey, JSON.stringify(data), { expirationTtl: TTL_31_DAYS })
+	}
+
+	const tokenManager = initializeSchwabAuthClient(
+		config,
+		config.SCHWAB_REDIRECT_URI,
+		loadToken,
+		saveToken,
+	)
+	await tokenManager.initialize()
+
+	return createApiClient({
+		config: { environment: ENVIRONMENTS.PRODUCTION },
+		auth: tokenManager,
+	})
+}
+
+function checkApiKey(c: any): Response | null {
+	const apiKey = c.req.header('X-API-Key')
+	if (!apiKey || apiKey !== c.env.SCHWAB_REST_API_KEY) {
+		return c.json({ error: 'Unauthorized' }, 401)
+	}
+	return null
+}
+
+/** GET /api/quotes?symbols=NVDA,PLTR&fields=quote,fundamental */
+app.get('/api/quotes', async (c) => {
+	const denied = checkApiKey(c)
+	if (denied) return denied
+
+	const symbolsParam = c.req.query('symbols') ?? ''
+	const fieldsParam = c.req.query('fields') ?? 'quote'
+	if (!symbolsParam) return c.json({ error: 'symbols parameter required' }, 400)
+
+	const symbols = symbolsParam.split(',').map(s => s.trim())
+	const fields = fieldsParam.split(',').map(s => s.trim()) as Array<'all' | 'quote' | 'fundamental' | 'extended' | 'reference' | 'regular'>
+
+	try {
+		const config = getConfig(c.env)
+		const client = await createRestClient(c.env.OAUTH_KV, config)
+		if (!client) return c.json({ error: 'No active Schwab authentication' }, 503)
+		const data = await client.marketData.quotes.getQuotes({
+			queryParams: { symbols, fields },
+		})
+		return c.json(data)
+	} catch (error) {
+		return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
+	}
+})
+
+/** GET /api/price-history?symbol=NVDA&periodType=month&period=6&frequencyType=daily */
+app.get('/api/price-history', async (c) => {
+	const denied = checkApiKey(c)
+	if (denied) return denied
+
+	const symbol = c.req.query('symbol') ?? ''
+	const periodType = (c.req.query('periodType') ?? 'month') as any
+	const period = parseInt(c.req.query('period') ?? '6', 10)
+	const frequencyType = (c.req.query('frequencyType') ?? 'daily') as any
+	const frequency = parseInt(c.req.query('frequency') ?? '1', 10)
+	if (!symbol) return c.json({ error: 'symbol parameter required' }, 400)
+
+	try {
+		const config = getConfig(c.env)
+		const client = await createRestClient(c.env.OAUTH_KV, config)
+		if (!client) return c.json({ error: 'No active Schwab authentication' }, 503)
+		const data = await client.marketData.priceHistory.getPriceHistory({
+			queryParams: { symbol, periodType, period, frequencyType, frequency },
+		})
+		return c.json(data)
+	} catch (error) {
+		return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
+	}
+})
+
+/** GET /api/market-hours?markets=equity */
+app.get('/api/market-hours', async (c) => {
+	const denied = checkApiKey(c)
+	if (denied) return denied
+
+	const markets = (c.req.query('markets') ?? 'equity') as any
+	const date = c.req.query('date')
+
+	try {
+		const config = getConfig(c.env)
+		const client = await createRestClient(c.env.OAUTH_KV, config)
+		if (!client) return c.json({ error: 'No active Schwab authentication' }, 503)
+		const data = await client.marketData.marketHours.getMarketHours({
+			queryParams: {
+				markets,
+				date: date ? new Date(date).toISOString() : undefined,
+			},
+		})
+		return c.json(data)
+	} catch (error) {
+		return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
 	}
 })
 
