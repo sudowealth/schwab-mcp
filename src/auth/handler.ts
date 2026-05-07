@@ -402,4 +402,31 @@ app.get('/callback', async (c) => {
 	}
 })
 
+/**
+ * POST /register - Dynamic client registration endpoint
+ * Allows mcp-remote and other OAuth clients to register
+ */
+app.post('/register', async (c) => {
+	try {
+		const body = await c.req.json().catch(() => ({}))
+		const clientId = body.client_id || 'claude-desktop'
+		const redirectUris = body.redirect_uris || []
+
+		// Return a valid registration response
+		return c.json(
+			{
+				client_id: clientId,
+				client_secret: undefined,
+				redirect_uris: redirectUris,
+				token_endpoint_auth_method: 'none',
+				grant_types: ['authorization_code'],
+				response_types: ['code'],
+			},
+			201,
+		)
+	} catch (error) {
+		return c.json({ error: 'registration_failed' }, 500)
+	}
+})
+
 export { app as SchwabHandler }
