@@ -122,6 +122,24 @@ export function renderApprovalDialog(
           font-size: 0.9rem;
           margin-top: 1rem;
         }
+        .invite-field {
+          text-align: left;
+          margin-bottom: 1.5rem;
+        }
+        .invite-field label {
+          display: block;
+          color: #666;
+          font-size: 0.9rem;
+          margin-bottom: 0.5rem;
+        }
+        .invite-field input {
+          width: 100%;
+          box-sizing: border-box;
+          padding: 0.75rem;
+          border: 1px solid #ddd;
+          border-radius: 8px;
+          font-size: 1rem;
+        }
       </style>
     </head>
     <body>
@@ -132,6 +150,10 @@ export function renderApprovalDialog(
         
         <form method="post" action="${new URL(request.url).pathname}" id="approvalForm">
           <input type="hidden" name="state" value="${encodedState}">
+          <div class="invite-field">
+            <label for="inviteCode">Invite code &mdash; first-time users only</label>
+            <input type="text" name="inviteCode" id="inviteCode" placeholder="Leave blank if already enrolled" autocomplete="off">
+          </div>
           <button type="submit" class="btn" id="approveBtn">
             <span id="btnText">Continue to Schwab</span>
             <div class="spinner" id="spinner"></div>
@@ -159,6 +181,13 @@ export function renderApprovalDialog(
           }
         }, 1000);
         
+        // A first-time user needs time to type their invite code, so stop
+        // the auto-submit countdown as soon as the field is touched
+        document.getElementById('inviteCode').addEventListener('focus', () => {
+          clearInterval(timer);
+          document.querySelector('.auto-redirect').style.display = 'none';
+        });
+
         // Handle manual click
         form.addEventListener('submit', (e) => {
           e.preventDefault();

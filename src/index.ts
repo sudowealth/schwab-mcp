@@ -1,5 +1,8 @@
 import OAuthProvider from '@cloudflare/workers-oauth-provider'
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import {
+	McpServer,
+	type RegisteredTool,
+} from '@modelcontextprotocol/sdk/server/mcp.js'
 import {
 	createApiClient,
 	sanitizeKeyForLog,
@@ -8,9 +11,13 @@ import {
 	type SchwabApiLogger,
 	type TokenData,
 } from '@sudowealth/schwab-api'
-import { DurableMCP } from 'workers-mcp'
+import { DurableObject } from 'cloudflare:workers'
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { type ValidatedEnv } from '../types/env'
 import { SchwabHandler, initializeSchwabAuthClient } from './auth'
+import { type ToolScope } from './auth/allowlist'
+import { validateClientRegistration } from './auth/registration'
 import { getConfig } from './config'
 import {
 	APP_NAME,
@@ -25,20 +32,34 @@ import { makeKvTokenStore, type TokenIdentifiers } from './shared/kvTokenStore'
 import { logger, buildLogger, type PinoLogLevel } from './shared/log'
 import { logOnlyInDevelopment } from './shared/secureLogger'
 import { createTool, toolError, toolSuccess } from './shared/toolBuilder'
-import { allToolSpecs, type ToolSpec } from './tools'
+import { marketToolSpecs, traderToolSpecs, type ToolSpec } from './tools'
+import { SseEdgeTransport } from './transports/sseEdgeTransport'
+import { StreamableHttpEdgeTransport } from './transports/streamableHttpTransport'
 
 /**
  * DO props now contain only IDs needed for token key derivation
  * Tokens are stored exclusively in KV to prevent divergence
  */
 type MyMCPProps = {
-	/** Schwab user ID when available (preferred for token key) */
-	schwabUserId?: string
+	/** Stable Schwab customer ID when available (preferred for token key) */
+	schwabCustomerId?: string
 	/** OAuth client ID (fallback for token key) */
 	clientId?: string
+	/**
+	 * Tool families this grant may use. Absent on grants issued before
+	 * scopes existed; those are treated as market-only until the weekly
+	 * Schwab re-auth rewrites the grant props from the allowlist record.
+	 */
+	toolScope?: ToolScope
 }
 
-export class MyMCP extends DurableMCP<MyMCPProps, Env> {
+export class MyMCP extends DurableObject<Env> {
+	props: MyMCPProps = {}
+	private initRun = false
+	private registeredScope?: ToolScope
+	private traderToolHandles: RegisteredTool[] = []
+	private sseTransport?: SseEdgeTransport
+	private streamableTransport?: StreamableHttpEdgeTransport
 	private tokenManager!: EnhancedTokenManager
 	private client!: SchwabApiClient
 	private validatedConfig!: ValidatedEnv
@@ -48,6 +69,62 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 		name: APP_NAME,
 		version: '0.0.1',
 	})
+
+	async _init(props: MyMCPProps) {
+		this.props = props
+		if (!this.initRun) {
+			this.initRun = true
+			await this.init()
+		} else if (this.registeredScope !== undefined) {
+			// A warm DO outlives re-authorization: when the Schwab re-auth
+			// rewrites the grant props with a changed scope, pick it up here
+			// instead of waiting for DO eviction.
+			this.applyToolScope(props.toolScope === 'full' ? 'full' : 'market')
+		}
+	}
+
+	/** Wraps a ToolSpec into an McpServer tool and returns the SDK handle. */
+	private registerSpec(spec: ToolSpec<any>): RegisteredTool {
+		return createTool(this.client, this.server, {
+			name: spec.name,
+			description: spec.description,
+			schema: spec.schema,
+			handler: async (params, c) => {
+				try {
+					const data = await spec.call(c, params)
+					return toolSuccess({
+						data,
+						source: spec.name,
+						message: `Successfully executed ${spec.name}`,
+					})
+				} catch (error) {
+					return toolError(error, { source: spec.name })
+				}
+			},
+		})
+	}
+
+	/**
+	 * Adds or removes the trader tools so the registered set matches the
+	 * grant's scope. Market tools are the always-present baseline; trader
+	 * tools (accounts, orders, transactions) exist only under full scope.
+	 */
+	private applyToolScope(scope: ToolScope) {
+		if (this.registeredScope === scope) return
+		if (scope === 'full') {
+			this.traderToolHandles = traderToolSpecs.map((spec) =>
+				this.registerSpec(spec),
+			)
+		} else {
+			this.traderToolHandles.forEach((handle) => handle.remove())
+			this.traderToolHandles = []
+		}
+		this.mcpLogger.info('Tool scope applied', {
+			from: this.registeredScope,
+			to: scope,
+		})
+		this.registeredScope = scope
+	}
 
 	async init() {
 		try {
@@ -77,7 +154,10 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 			this.mcpLogger.debug('[MyMCP.init] STEP 1: Env initialized.')
 
 			// Create KV token store - single source of truth
-			const kvToken = makeKvTokenStore(this.validatedConfig.OAUTH_KV)
+			const kvToken = makeKvTokenStore(
+				this.validatedConfig.OAUTH_KV,
+				this.validatedConfig.TOKEN_ENCRYPTION_KEY,
+			)
 
 			// Ensure clientId is stored in props for token key derivation
 			if (!this.props.clientId) {
@@ -86,7 +166,7 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 			}
 
 			const getTokenIds = (): TokenIdentifiers => ({
-				schwabUserId: this.props.schwabUserId,
+				customId: this.props.schwabCustomerId,
 				clientId: this.props.clientId,
 			})
 
@@ -96,7 +176,7 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 				'debug',
 				'[MyMCP.init] Token identifiers',
 				{
-					hasSchwabUserId: !!this.props.schwabUserId,
+					hasSchwabCustomerId: !!this.props.schwabCustomerId,
 					hasClientId: !!this.props.clientId,
 					expectedKeyPrefix: sanitizeKeyForLog(kvToken.kvKey(getTokenIds())),
 				},
@@ -114,7 +194,7 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 			const loadTokenForETM = async (): Promise<TokenData | null> => {
 				const tokenIds = getTokenIds()
 				this.mcpLogger.debug('[ETM Load] Attempting to load token', {
-					hasSchwabUserId: !!tokenIds.schwabUserId,
+					hasSchwabCustomerId: !!tokenIds.customId,
 					hasClientId: !!tokenIds.clientId,
 					expectedKeyPrefix: sanitizeKeyForLog(kvToken.kvKey(tokenIds)),
 				})
@@ -168,14 +248,8 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 				`[MyMCP.init] STEP 5B: Proactive ETM initialization complete. Success: ${etmInitSuccess}`,
 			)
 
-			// 2.5. Auto-migrate tokens if we have schwabUserId but token was loaded from clientId key
-			if (this.props.schwabUserId && this.props.clientId) {
-				await kvToken.migrateIfNeeded(
-					{ clientId: this.props.clientId },
-					{ schwabUserId: this.props.schwabUserId },
-				)
-				this.mcpLogger.debug('[MyMCP.init] STEP 5C: Token migration completed')
-			}
+			// The auth callback stores tokens under the customerId key before any
+			// grant exists, so no clientId->customerId migration is needed here.
 
 			// 3. Create SchwabApiClient AFTER tokens are loaded
 			this.client = createApiClient({
@@ -185,35 +259,25 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 					enableLogging: true,
 					logLevel:
 						this.validatedConfig.ENVIRONMENT === 'production'
-							? 'error'
+							? 'info'
 							: 'debug',
 				},
 				auth: this.tokenManager,
 			})
 			this.mcpLogger.debug('[MyMCP.init] STEP 6: SchwabApiClient ready.')
 
-			// 4. Register tools (this.server.tool calls are synchronous)
+			// 4. Register tools (this.server.tool calls are synchronous).
+			// Trader tools (accounts, orders, transactions) are only exposed to
+			// grants with full scope; everyone else gets market data only.
 			this.mcpLogger.debug('[MyMCP.init] STEP 7A: Calling registerTools...')
-			allToolSpecs.forEach((spec: ToolSpec<any>) => {
-				createTool(this.client, this.server, {
-					name: spec.name,
-					description: spec.description,
-					schema: spec.schema,
-					handler: async (params, c) => {
-						try {
-							const data = await spec.call(c, params)
-							return toolSuccess({
-								data,
-								source: spec.name,
-								message: `Successfully executed ${spec.name}`,
-							})
-						} catch (error) {
-							return toolError(error, { source: spec.name })
-						}
-					},
-				})
+			if (this.registeredScope === undefined) {
+				marketToolSpecs.forEach((spec) => void this.registerSpec(spec))
+				this.registeredScope = 'market'
+			}
+			this.applyToolScope(this.props.toolScope === 'full' ? 'full' : 'market')
+			this.mcpLogger.debug('[MyMCP.init] STEP 7B: registerTools completed.', {
+				toolScope: this.registeredScope,
 			})
-			this.mcpLogger.debug('[MyMCP.init] STEP 7B: registerTools completed.')
 			this.mcpLogger.debug(
 				'[MyMCP.init] STEP 8: MyMCP.init FINISHED SUCCESSFULLY',
 			)
@@ -322,17 +386,196 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 		}
 	}
 
-	async onSSE(event: any) {
+	/** POST /mcp - Streamable HTTP transport (current MCP spec) */
+	async onMcpPost(request: Request): Promise<Response> {
+		this.mcpLogger.debug('Streamable HTTP request received')
+		// _init() fully initializes a cold DO; the token manager refreshes
+		// tokens on demand per API call, so warm requests need no recovery
+		// dance here (unlike the long-lived legacy SSE connections).
+		if (!this.tokenManager) {
+			await this.onReconnect()
+		}
+		// If the Schwab leg is dead (no tokens, unreadable record, or refresh
+		// token expired), answer HTTP 401 so the MCP client re-runs its OAuth
+		// flow. A Schwab failure surfaced as an in-band tool error keeps this
+		// layer's token valid and gives the client no signal to re-authorize.
+		let schwabAuthAlive = false
+		try {
+			schwabAuthAlive = !!(await this.tokenManager.getAccessToken())
+		} catch {
+			schwabAuthAlive = false
+		}
+		if (!schwabAuthAlive) {
+			this.mcpLogger.warn(
+				'Schwab tokens unavailable; returning 401 to trigger client re-auth',
+			)
+			const resourceMetadata = `${new URL(request.url).origin}/.well-known/oauth-protected-resource/mcp`
+			return new Response('Schwab authentication expired; please re-authorize', {
+				status: 401,
+				headers: {
+					'WWW-Authenticate': `Bearer error="invalid_token", error_description="Schwab authentication expired", resource_metadata="${resourceMetadata}"`,
+				},
+			})
+		}
+		if (!this.streamableTransport) {
+			this.streamableTransport = new StreamableHttpEdgeTransport(
+				this.ctx.id.toString(),
+			)
+			await this.server.connect(this.streamableTransport)
+		}
+		return await this.streamableTransport.handleRequest(request)
+	}
+
+	/** DELETE /mcp - explicit session termination */
+	async onMcpDelete(): Promise<Response> {
+		if (this.streamableTransport) {
+			const response = await this.streamableTransport.handleDeleteRequest()
+			// The DO is shared per user; drop the closed transport so the next
+			// request gets a fresh one instead of 503s forever.
+			this.streamableTransport = undefined
+			return response
+		}
+		return new Response(null, { status: 200 })
+	}
+
+	/** GET /sse - legacy HTTP+SSE transport, kept for clients that haven't migrated */
+	async onSSE(): Promise<Response> {
 		this.mcpLogger.info('SSE connection established or reconnected')
 		await this.onReconnect()
-		return await super.onSSE(event)
+		this.sseTransport = new SseEdgeTransport(
+			API_ENDPOINTS.SSE_MESSAGE,
+			this.ctx.id.toString(),
+		)
+		await this.server.connect(this.sseTransport)
+		return this.sseTransport.sseResponse
+	}
+
+	/** POST /sse/message - companion to the legacy SSE transport */
+	async onSSEMessage(request: Request): Promise<Response> {
+		if (!this.sseTransport) {
+			return new Response('SSE connection not established', { status: 500 })
+		}
+		return await this.sseTransport.handlePostMessage(request)
 	}
 }
 
-export default new OAuthProvider({
-	apiRoute: API_ENDPOINTS.SSE,
-	apiHandler: MyMCP.mount(API_ENDPOINTS.SSE) as any, // Cast remains due to library typing
+/** OAuthProvider attaches the authenticated grant's props to the execution context at runtime. */
+function propsFromExecutionCtx(ctx: unknown): MyMCPProps {
+	return (ctx as { props: MyMCPProps }).props
+}
+
+const mcpApp = new Hono<{ Bindings: Env }>()
+
+/**
+ * Route a request to its Durable Object. A client that echoes our
+ * Mcp-Session-Id header is routed straight back to its DO. Without the
+ * header (claude.ai does not echo it), derive a stable per-user DO from the
+ * OAuth grant's identity so repeat requests reuse a warm, initialized
+ * instance instead of paying full init on a fresh one each time.
+ */
+function mcpObjectFor(
+	env: Env,
+	sessionId: string | undefined,
+	props: MyMCPProps,
+) {
+	const ns = env.MCP_OBJECT
+	if (sessionId) {
+		try {
+			return ns.get(ns.idFromString(sessionId))
+		} catch {
+			return null // malformed session id from client
+		}
+	}
+	const name = props.schwabCustomerId
+		? `user:${props.schwabCustomerId}`
+		: props.clientId
+			? `client:${props.clientId}`
+			: null
+	return ns.get(name ? ns.idFromName(name) : ns.newUniqueId())
+}
+
+mcpApp.post(API_ENDPOINTS.MCP, cors(), async (c) => {
+	const props = propsFromExecutionCtx(c.executionCtx)
+	const object = mcpObjectFor(c.env, c.req.header('Mcp-Session-Id'), props)
+	if (!object) {
+		return new Response('Invalid Mcp-Session-Id', { status: 400 })
+	}
+	await object._init(props)
+	return await object.onMcpPost(c.req.raw)
+})
+
+mcpApp.get(API_ENDPOINTS.MCP, cors(), async () => {
+	return new Response(null, { status: 405, headers: { Allow: 'POST' } })
+})
+
+mcpApp.delete(API_ENDPOINTS.MCP, cors(), async (c) => {
+	const sessionId = c.req.header('Mcp-Session-Id')
+	if (!sessionId) {
+		return new Response('Missing Mcp-Session-Id', { status: 400 })
+	}
+	const object = mcpObjectFor(c.env, sessionId, {})
+	if (!object) {
+		return new Response('Invalid Mcp-Session-Id', { status: 400 })
+	}
+	return await object.onMcpDelete()
+})
+
+mcpApp.get(API_ENDPOINTS.SSE, cors(), async (c) => {
+	const object = c.env.MCP_OBJECT.get(c.env.MCP_OBJECT.newUniqueId())
+	await object._init(propsFromExecutionCtx(c.executionCtx))
+	return await object.onSSE()
+})
+
+mcpApp.post(API_ENDPOINTS.SSE_MESSAGE, cors(), async (c) => {
+	const sessionId = c.req.query('sessionId')
+	if (!sessionId) {
+		return new Response(
+			'Missing sessionId. Expected GET to /sse to initiate one',
+			{ status: 400 },
+		)
+	}
+	const object = c.env.MCP_OBJECT.get(c.env.MCP_OBJECT.idFromString(sessionId))
+	return await object.onSSEMessage(c.req.raw)
+})
+
+const oauthProvider = new OAuthProvider({
+	apiRoute: [API_ENDPOINTS.MCP, API_ENDPOINTS.SSE, API_ENDPOINTS.SSE_MESSAGE],
+	apiHandler: mcpApp as any, // Hono app satisfies the { fetch } handler shape OAuthProvider expects
 	defaultHandler: SchwabHandler as any, // Cast remains
 	authorizeEndpoint: API_ENDPOINTS.AUTHORIZE,
 	tokenEndpoint: API_ENDPOINTS.TOKEN,
+	clientRegistrationEndpoint: API_ENDPOINTS.REGISTER, // This was missing in origin repo.
+	clientRegistrationCallback: validateClientRegistration,
 })
+
+/**
+ * Public, unauthenticated auth endpoints get a per-IP rate limit. The MCP
+ * endpoints are excluded: they require a bearer token, and legitimate tool
+ * traffic can burst well past any limit suitable for the auth surface.
+ */
+const RATE_LIMITED_PATHS = new Set<string>([
+	API_ENDPOINTS.REGISTER,
+	API_ENDPOINTS.AUTHORIZE,
+	API_ENDPOINTS.TOKEN,
+	API_ENDPOINTS.CALLBACK,
+])
+
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+		// Skip OPTIONS so rate limiting can't break CORS preflights
+		if (request.method !== 'OPTIONS' && env.AUTH_RATE_LIMITER) {
+			const { pathname } = new URL(request.url)
+			if (RATE_LIMITED_PATHS.has(pathname)) {
+				const key = request.headers.get('CF-Connecting-IP') ?? 'unknown'
+				const { success } = await env.AUTH_RATE_LIMITER.limit({ key })
+				if (!success) {
+					return new Response('Too many requests', {
+						status: 429,
+						headers: { 'Retry-After': '60' },
+					})
+				}
+			}
+		}
+		return oauthProvider.fetch(request, env, ctx)
+	},
+}

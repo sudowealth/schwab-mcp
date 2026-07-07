@@ -35,7 +35,11 @@ export const LOGGER_CONTEXTS = {
  * API Endpoints
  */
 export const API_ENDPOINTS = {
+	/** Streamable HTTP (current MCP spec transport) */
+	MCP: '/mcp',
+	/** Legacy HTTP+SSE transport, kept for clients that haven't migrated */
 	SSE: '/sse',
+	SSE_MESSAGE: '/sse/message',
 	AUTHORIZE: '/authorize',
 	TOKEN: '/token',
 	CALLBACK: '/callback',
@@ -68,3 +72,26 @@ export const CONTENT_TYPES = {
  */
 export const TOKEN_KEY_PREFIX = 'token:' as const
 export const TTL_31_DAYS = 31 * 24 * 60 * 60
+
+/**
+ * Access Gating Constants
+ *
+ * `allowed:<schwabClientCustomerId>` marks an enrolled customer.
+ * `invite:<code>` is a one-time invite code, consumed on first use.
+ */
+export const ALLOWLIST_KEY_PREFIX = 'allowed:' as const
+export const INVITE_KEY_PREFIX = 'invite:' as const
+
+/**
+ * Hosts (and their subdomains) that dynamically registered OAuth clients may
+ * use in redirect_uris. Keeps /register from being used to point auth codes
+ * at arbitrary attacker-controlled callbacks. Loopback hosts are additionally
+ * allowed for local dev tools like the MCP inspector.
+ */
+export const ALLOWED_REDIRECT_HOSTS = [
+	'claude.ai',
+	'claude.com',
+	'anthropic.com',
+	'chatgpt.com',
+	'openai.com',
+] as const

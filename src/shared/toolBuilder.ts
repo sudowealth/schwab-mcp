@@ -171,11 +171,12 @@ export function createTool<S extends z.ZodSchema<any, any>>(
 	logger.info(`[ToolBuilder] Added tool '${name}' to internal toolRegistry.`)
 
 	// Keep individual tool registration with McpServer for potential direct calls
-	// or if the dispatcher logic is ever removed.
+	// or if the dispatcher logic is ever removed. The returned handle lets the
+	// caller remove the tool later (used for per-user tool scoping).
 	logger.info(
 		`[ToolBuilder] Registering tool with McpServer for direct call: '${name}'.`,
 	)
-	server.tool(
+	return server.tool(
 		name,
 		description,
 		schema instanceof z.ZodObject ? schema.shape : {},

@@ -79,6 +79,8 @@ export function initializeSchwabAuthClient(
  * @param config Validated environment configuration
  * @param oauthReqInfo OAuth request information
  * @param headers Optional headers to include in the response
+ * @param inviteCode Optional one-time invite code, carried through the OAuth
+ *   state so the callback can enroll a first-time user after Schwab login
  * @returns Redirect response to Schwab's authorization page
  */
 export async function redirectToSchwab(
@@ -94,12 +96,16 @@ export async function redirectToSchwab(
 	config: ValidatedEnv,
 	oauthReqInfo: AuthRequest,
 	headers: HeadersInit = {},
+	inviteCode?: string,
 ): Promise<Response> {
 	try {
 		const auth = initializeSchwabAuthClient(config)
 
 		// Use SDK's OAuth state encoder
-		const encodedState = encodeOAuthState(oauthReqInfo)
+		const statePayload = inviteCode
+			? ({ ...oauthReqInfo, inviteCode } as AuthRequest)
+			: oauthReqInfo
+		const encodedState = encodeOAuthState(statePayload)
 		const { authUrl } = await auth.getAuthorizationUrl({
 			state: encodedState,
 		})

@@ -23,6 +23,16 @@ const envSchema = z.object({
 		})
 		.min(1, 'COOKIE_ENCRYPTION_KEY cannot be empty'),
 
+	TOKEN_ENCRYPTION_KEY: z
+		.string({
+			required_error:
+				'TOKEN_ENCRYPTION_KEY is required to encrypt Schwab tokens in KV',
+		})
+		.regex(
+			/^[0-9a-fA-F]{64}$/,
+			'TOKEN_ENCRYPTION_KEY must be 64 hex characters (generate with: openssl rand -hex 32)',
+		),
+
 	SCHWAB_REDIRECT_URI: z
 		.string({
 			required_error: 'SCHWAB_REDIRECT_URI is required for OAuth callback',

@@ -173,3 +173,6 @@ wrangler.local.jsonc
 wrangler.deploy.jsonc
 .dev.vars
 .wrangler/
+
+# Claude Code local config
+.claude/

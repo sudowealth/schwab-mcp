@@ -1,0 +1,34 @@
+diff --git a/node_modules/@sudowealth/schwab-api/dist/src/core/http.js b/node_modules/@sudowealth/schwab-api/dist/src/core/http.js
+index 4e52a40..e65caa8 100644
+--- a/node_modules/@sudowealth/schwab-api/dist/src/core/http.js
++++ b/node_modules/@sudowealth/schwab-api/dist/src/core/http.js
+@@ -221,17 +221,21 @@ async function schwabFetchWithContext(context, endpoint, options) {
+         }
+         const responseData = await response.json();
+         log(context, 'debug', `Response data for ${method} ${endpointTemplate}:`, responseData);
++        // Patched: return Schwab's raw response instead of the zod-parsed result.
++        // The packaged schemas reject real API values (e.g. exchangeName 'NASDAQ',
++        // null currencyType) and zod's default strip mode silently drops fields
++        // they don't declare (e.g. option contract bid/ask/mark/last). Validation
++        // still runs so schema drift is visible in logs, but never blocks or
++        // filters the data.
+         const parsedResponse = responseSchema.safeParse(responseData);
+         if (!parsedResponse.success) {
+-            const SENSITIVE_MAX_ERROR_LENGTH = 500; // To avoid overly long messages
+-            const validationErrors = JSON.stringify(parsedResponse.error.format(), null, 2);
+-            const truncatedErrors = validationErrors.length > SENSITIVE_MAX_ERROR_LENGTH
+-                ? validationErrors.substring(0, SENSITIVE_MAX_ERROR_LENGTH) +
+-                    '... (truncated)'
+-                : validationErrors;
+-            throw createSchwabApiError(500, parsedResponse.error.format(), `Invalid response data structure for ${method} ${endpointTemplate}. Validation errors: ${truncatedErrors}`);
++            const issues = parsedResponse.error.issues
++                .slice(0, 5)
++                .map((i) => `${i.path.join('.')}: ${i.message}`)
++                .join('; ');
++            log(context, 'warn', `Response schema mismatch for ${method} ${endpointTemplate} (returning raw data): ${issues}`);
+         }
+-        return parsedResponse.data;
++        return responseData;
+     }
+     catch (error) {
+         // Handle AbortError separately

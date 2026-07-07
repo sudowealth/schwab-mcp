@@ -104,10 +104,18 @@ export const toolSpecs = [
 		name: 'getOptionChain',
 		description: 'Get option chain for an optionable symbol',
 		schema: GetOptionChainParams,
-		call: (c, p) =>
-			c.marketData.options.getOptionChain({
-				queryParams: { symbol: p.symbol },
-			}),
+		call: (c, p) => {
+			logger.info('[getOptionChain] Fetching option chain', {
+				symbol: p.symbol,
+				contractType: p.contractType,
+				strikeCount: p.strikeCount,
+				fromDate: p.fromDate,
+				toDate: p.toDate,
+			})
+			return c.marketData.options.getOptionChain({
+				queryParams: p,
+			})
+		},
 	}),
 	createToolSpec({
 		name: 'getOptionExpirationChain',

@@ -10,6 +10,7 @@ import {
 	HTTP_HEADERS,
 } from '../shared/constants'
 import { logger } from '../shared/log'
+import { normalizeInviteCode } from './allowlist'
 import { AuthErrors } from './errors'
 import { ApprovedClientsSchema } from './schemas'
 import { extractClientIdFromState, type StateData } from './stateUtils'
@@ -111,6 +112,17 @@ export async function clientIdAlreadyApproved(
 export interface ParsedApprovalResult {
 	state: StateData
 	headers: Record<string, string>
+	/** One-time invite code entered on the approval dialog, if any */
+	inviteCode?: string
+}
+
+/**
+ * Builds a Set-Cookie header that clears the approval cookie. Used when
+ * access is denied so the approval dialog (with its invite-code field)
+ * is shown again on the next attempt instead of being skipped.
+ */
+export function buildClearApprovalCookieHeader(): string {
+	return `${MCP_APPROVAL}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`
 }
 
 export async function parseRedirectApproval(
@@ -125,10 +137,12 @@ export async function parseRedirectApproval(
 	let encodedState: string
 	let state: StateData
 	let clientId: string
+	let inviteCode: string | undefined
 
 	try {
 		const formData = await request.formData()
 		const stateParam = formData.get('state')
+		inviteCode = normalizeInviteCode(formData.get('inviteCode'))
 
 		if (typeof stateParam !== 'string' || !stateParam) {
 			throw new AuthErrors.MissingFormState()
@@ -186,5 +200,6 @@ export async function parseRedirectApproval(
 	return {
 		state,
 		headers: { [HTTP_HEADERS.SET_COOKIE]: cookieHeaderValue },
+		inviteCode,
 	}
 }

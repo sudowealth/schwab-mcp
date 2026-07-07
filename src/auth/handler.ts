@@ -13,8 +13,13 @@ import { getConfig } from '../config'
 import { LOGGER_CONTEXTS, APP_SERVER_NAME } from '../shared/constants'
 import { makeKvTokenStore } from '../shared/kvTokenStore'
 import { logger } from '../shared/log'
+import { getEnrolledScope, enrollWithInviteCode } from './allowlist'
 import { initializeSchwabAuthClient, redirectToSchwab } from './client'
-import { clientIdAlreadyApproved, parseRedirectApproval } from './cookies'
+import {
+	clientIdAlreadyApproved,
+	parseRedirectApproval,
+	buildClearApprovalCookieHeader,
+} from './cookies'
 import { mapSchwabError } from './errorMapping'
 import {
 	AuthErrors,
@@ -97,7 +102,10 @@ app.get('/authorize', async (c) => {
 app.post('/authorize', async (c) => {
 	try {
 		const config = getConfig(c.env)
-		const { state, headers } = await parseRedirectApproval(c.req.raw, config)
+		const { state, headers, inviteCode } = await parseRedirectApproval(
+			c.req.raw,
+			config,
+		)
 
 		if (!state.oauthReqInfo) {
 			const error = new AuthErrors.MissingState()
@@ -105,6 +113,10 @@ app.post('/authorize', async (c) => {
 			oauthLogger.error(errorInfo.message)
 			const jsonResponse = createJsonErrorResponse(error)
 			return c.json(jsonResponse, errorInfo.status as any)
+		}
+
+		if (inviteCode) {
+			oauthLogger.info('Invite code entered on approval form', { inviteCode })
 		}
 
 		// Pass the actual AuthRequest object to redirectToSchwab
@@ -128,7 +140,7 @@ app.post('/authorize', async (c) => {
 			return c.json(jsonResponse, errorInfo.status as any)
 		}
 
-		return redirectToSchwab(c, config, authRequestForSchwab, headers)
+		return redirectToSchwab(c, config, authRequestForSchwab, headers, inviteCode)
 	} catch (error) {
 		const authError = new AuthErrors.AuthApproval()
 		const errorInfo = formatAuthError(authError, { error })
@@ -189,6 +201,12 @@ app.get('/callback', async (c) => {
 			decodedStateAsAuthRequest,
 		)
 
+		// Pull the invite code (if any) out of the state before it is passed to
+		// completeAuthorization; it is our field, not part of the AuthRequest.
+		const stateExtras = decodedStateAsAuthRequest as { inviteCode?: string }
+		const inviteCode = stateExtras.inviteCode
+		delete stateExtras.inviteCode
+
 		// Validate required AuthRequest fields directly on `decodedStateAsAuthRequest`
 		if (
 			!decodedStateAsAuthRequest?.clientId || // Should be redundant due to extractClientIdFromState
@@ -211,9 +229,12 @@ app.get('/callback', async (c) => {
 
 		// Set up redirect URI and token storage using centralized KV helper
 		const redirectUri = config.SCHWAB_REDIRECT_URI
-		const kvToken = makeKvTokenStore(config.OAUTH_KV)
+		const kvToken = makeKvTokenStore(
+			config.OAUTH_KV,
+			config.TOKEN_ENCRYPTION_KEY,
+		)
 
-		// Initial token identifiers (before we get schwabUserId)
+		// Initial token identifiers (before we get schwabCustomerId)
 		const getInitialTokenIds = () => ({ clientId: clientIdFromState })
 
 		const saveToken = async (tokenData: TokenData) => {
@@ -289,10 +310,13 @@ app.get('/callback', async (c) => {
 			throw new AuthErrors.NoUserId()
 		}
 
-		const userIdFromSchwab =
-			userPreferences?.streamerInfo?.[0]?.schwabClientCorrelId
+		// Use schwabClientCustomerId as the user identity: it is stable across
+		// logins, unlike schwabClientCorrelId which Schwab re-mints per
+		// authorization (and which this code previously keyed on).
+		const schwabCustomerId =
+			userPreferences?.streamerInfo?.[0]?.schwabClientCustomerId
 
-		if (!userIdFromSchwab) {
+		if (!schwabCustomerId) {
 			const error = new AuthErrors.NoUserId()
 			const errorInfo = formatAuthError(error)
 			oauthLogger.error(errorInfo.message)
@@ -300,20 +324,78 @@ app.get('/callback', async (c) => {
 			return c.json(jsonResponse, errorInfo.status as any)
 		}
 
-		// Migrate token from clientId-based key to schwabUserId-based key
+		// Access gate: only enrolled customers (or first-timers redeeming a
+		// valid invite code) may complete authorization. The enrollment also
+		// carries the customer's tool scope (market-only by default).
+		let toolScope = await getEnrolledScope(config.OAUTH_KV, schwabCustomerId)
+		if (toolScope === null && inviteCode) {
+			toolScope = await enrollWithInviteCode(
+				config.OAUTH_KV,
+				inviteCode,
+				schwabCustomerId,
+			)
+			if (toolScope !== null) {
+				oauthLogger.info('Successfully logged in using invite code', {
+					inviteCode,
+					customerIdPrefix: `${schwabCustomerId.slice(0, 8)}...`,
+					toolScope,
+				})
+			}
+		}
+		if (toolScope === null) {
+			oauthLogger.warn('Denied authorization for unenrolled Schwab customer')
+			// Remove the Schwab tokens saved during the code exchange; a denied
+			// user should leave nothing behind.
+			try {
+				await kvToken.delete({ clientId: clientIdFromState })
+			} catch (cleanupError) {
+				oauthLogger.error('Failed to clean up tokens for denied customer', {
+					error:
+						cleanupError instanceof Error
+							? cleanupError.message
+							: String(cleanupError),
+				})
+			}
+			// Clear the approval cookie so the next attempt shows the approval
+			// dialog (and its invite-code field) instead of skipping it.
+			return c.html(
+				`<!DOCTYPE html>
+				<html lang="en"><head><meta charset="UTF-8"><title>Access denied</title></head>
+				<body style="font-family: sans-serif; max-width: 480px; margin: 4rem auto;">
+					<h1>Access denied</h1>
+					<p>Your Schwab login succeeded, but this server is invite-only and
+					your account is not enrolled.</p>
+					<p>If you have an invite code, reconnect from your MCP client and
+					enter the code on the approval screen.</p>
+				</body></html>`,
+				403,
+				{ 'Set-Cookie': buildClearApprovalCookieHeader() },
+			)
+		}
+
+		// Move the freshly exchanged tokens from the transient clientId key to
+		// the stable customerId key. We overwrite unconditionally instead of
+		// using migrate(), because on re-authentication the customerId key
+		// already holds the previous (now-stale) tokens and migrate() refuses
+		// to overwrite an existing destination — it would discard the fresh
+		// tokens we just obtained and leave the expired ones in place.
 		try {
-			const currentTokenData = await kvToken.load({
-				clientId: clientIdFromState,
-			})
-			if (currentTokenData) {
-				// Save under schwabUserId key
-				await kvToken.save({ schwabUserId: userIdFromSchwab }, currentTokenData)
-				oauthLogger.info('Token migrated to schwabUserId key', {
+			const freshTokens = await kvToken.load({ clientId: clientIdFromState })
+			if (freshTokens) {
+				await kvToken.save({ customId: schwabCustomerId }, freshTokens)
+				await kvToken.delete({ clientId: clientIdFromState })
+				oauthLogger.info('Fresh tokens stored under schwabCustomerId key', {
 					fromKeyPrefix: sanitizeKeyForLog(
 						kvToken.kvKey({ clientId: clientIdFromState }),
 					),
 					toKeyPrefix: sanitizeKeyForLog(
-						kvToken.kvKey({ schwabUserId: userIdFromSchwab }),
+						kvToken.kvKey({ customId: schwabCustomerId }),
+					),
+				})
+			} else {
+				oauthLogger.warn('No freshly exchanged tokens found to store', {
+					fromKeyPrefix: sanitizeKeyForLog(
+						kvToken.kvKey({ clientId: clientIdFromState }),
 					),
 				})
 			}
@@ -332,13 +414,16 @@ app.get('/callback', async (c) => {
 		// Complete the authorization flow using the decoded AuthRequest object
 		const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
 			request: decodedStateAsAuthRequest,
-			userId: userIdFromSchwab,
-			metadata: { label: userIdFromSchwab },
+			userId: schwabCustomerId,
+			metadata: { label: schwabCustomerId },
 			scope: decodedStateAsAuthRequest.scope,
 			props: {
 				// Only store IDs for token key derivation - tokens are in KV
-				schwabUserId: userIdFromSchwab,
+				schwabCustomerId,
 				clientId: clientIdFromState,
+				// Tool scope rides in the grant props so the DO can register
+				// only the tool families this customer is entitled to.
+				toolScope,
 			},
 		})
 

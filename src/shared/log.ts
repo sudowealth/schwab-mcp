@@ -48,6 +48,8 @@ const REDACT_PATHS = [
 	'client_secret',
 	'clientSecret',
 	'schwabUserId',
+	'schwabCustomerId',
+	'schwabClientCustomerId',
 	'clientId',
 	'accountNumber',
 	'hashValue',
@@ -72,6 +74,8 @@ const REDACT_PATHS = [
 	'*.client_secret',
 	'*.clientSecret',
 	'*.schwabUserId',
+	'*.schwabCustomerId',
+	'*.schwabClientCustomerId',
 	'*.clientId',
 	'*.accountNumber',
 	'*.hashValue',
@@ -104,12 +108,52 @@ const serializers = {
 	},
 }
 
+/**
+ * In Workers pino runs in browser mode, where the `timestamp` option is
+ * ignored and logs go straight to console without one. Write each entry
+ * ourselves with an ISO timestamp (millisecond precision) as the first
+ * field. `serialize: true` keeps redaction applied before write is called.
+ */
+const LEVEL_LABELS: Record<number, string> = {
+	10: 'trace',
+	20: 'debug',
+	30: 'info',
+	40: 'warn',
+	50: 'error',
+	60: 'fatal',
+}
+
+function writeLog(consoleFn: (...args: unknown[]) => void) {
+	return (o: object) => {
+		const { time, level, msg, ...rest } = o as {
+			time?: number
+			level?: number
+			msg?: string
+			[key: string]: unknown
+		}
+		const ts = new Date(time ?? Date.now()).toISOString()
+		const label = LEVEL_LABELS[level ?? 30] ?? String(level)
+		if (Object.keys(rest).length > 0) {
+			consoleFn(`${ts} [${label}] ${msg ?? ''}`, rest)
+		} else {
+			consoleFn(`${ts} [${label}] ${msg ?? ''}`)
+		}
+	}
+}
+
 // Pino configuration for Cloudflare Workers
 const pinoConfig: pino.LoggerOptions = {
 	// Use browser transport for console output in Workers
 	browser: {
-		asObject: false,
 		serialize: true,
+		write: {
+			trace: writeLog(console.debug),
+			debug: writeLog(console.debug),
+			info: writeLog(console.info),
+			warn: writeLog(console.warn),
+			error: writeLog(console.error),
+			fatal: writeLog(console.error),
+		},
 	},
 	// Set redaction paths
 	redact: {
@@ -118,12 +162,8 @@ const pinoConfig: pino.LoggerOptions = {
 	},
 	// Custom serializers
 	serializers,
-	// Format timestamps
-	timestamp: pino.stdTimeFunctions.isoTime,
-	// Base context
-	base: {
-		env: 'cloudflare-worker',
-	},
+	// Base context (env tag adds noise to every line; timestamp carries the context)
+	base: undefined,
 }
 
 /**

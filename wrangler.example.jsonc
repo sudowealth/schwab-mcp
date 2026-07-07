@@ -35,6 +35,19 @@
 			"id": "YOUR_KV_NAMESPACE_ID_HERE", // Replace with your actual KV namespace ID
 		},
 	],
+	// Per-IP rate limit for the public auth endpoints (/register, /authorize,
+	// /token, /callback). Optional: if the binding is absent the worker skips
+	// rate limiting. 15 requests/60s comfortably fits a full OAuth login (~5).
+	"unsafe": {
+		"bindings": [
+			{
+				"name": "AUTH_RATE_LIMITER",
+				"type": "ratelimit",
+				"namespace_id": "1001", // Any integer unique among this worker's ratelimit bindings
+				"simple": { "limit": 15, "period": 60 },
+			},
+		],
+	},
 	"observability": {
 		"enabled": false, // Set to true for production monitoring (has costs)
 	},

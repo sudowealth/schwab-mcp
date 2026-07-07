@@ -21,6 +21,12 @@ export interface Env {
 	COOKIE_ENCRYPTION_KEY: string
 
 	/**
+	 * 64-hex-char secret (openssl rand -hex 32) used to AES-256-GCM encrypt
+	 * Schwab token records before they are written to KV
+	 */
+	TOKEN_ENCRYPTION_KEY: string
+
+	/**
 	 * OAuth redirect URI for callback after authentication
 	 * This should be a fixed, configured value to ensure consistency
 	 * across different environments and proxies
@@ -42,11 +48,6 @@ export interface Env {
 	 * Defaults to production if not specified
 	 */
 	ENVIRONMENT?: string
-
-	/**
-	 * Optional comma-separated list of additional redirect URI regex patterns
-	 */
-	ALLOWED_REDIRECT_REGEXPS?: string
 }
 
 /**
@@ -71,6 +72,12 @@ export interface ValidatedEnv {
 	readonly COOKIE_ENCRYPTION_KEY: string
 
 	/**
+	 * 64-hex-char secret (openssl rand -hex 32) used to AES-256-GCM encrypt
+	 * Schwab token records before they are written to KV
+	 */
+	readonly TOKEN_ENCRYPTION_KEY: string
+
+	/**
 	 * OAuth redirect URI for callback after authentication
 	 */
 	readonly SCHWAB_REDIRECT_URI: string
@@ -90,9 +97,4 @@ export interface ValidatedEnv {
 	 * Defaults to production if not specified
 	 */
 	readonly ENVIRONMENT?: 'development' | 'staging' | 'production'
-
-	/**
-	 * Optional comma-separated list of additional redirect URI regex patterns
-	 */
-	readonly ALLOWED_REDIRECT_REGEXPS?: string
 }
