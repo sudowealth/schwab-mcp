@@ -130,7 +130,7 @@ export function renderApprovalDialog(
         <h1>Connect to ${server.name}</h1>
         <p><strong>${client?.clientName || 'An MCP Client'}</strong> wants to access your Schwab account through ${server.name}.</p>
         
-        <form method="post" action="${new URL(request.url).pathname}" id="approvalForm">
+        <form method="post" action="" id="approvalForm">
           <input type="hidden" name="state" value="${encodedState}">
           <button type="submit" class="btn" id="approveBtn">
             <span id="btnText">Continue to Schwab</span>
