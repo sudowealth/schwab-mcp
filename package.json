@@ -30,9 +30,9 @@
     "@cloudflare/workers-oauth-provider": "^0.0.5",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@sudowealth/schwab-api": "^2.1.0",
+    "agents": "^0.7.9",
     "hono": "^4.7.11",
     "pino": "^9.7.0",
-    "workers-mcp": "^0.1.0-3",
     "zod": "^3.25.48"
   },
   "prettier": "@epic-web/config/prettier",

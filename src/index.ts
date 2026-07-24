@@ -8,7 +8,7 @@ import {
 	type SchwabApiLogger,
 	type TokenData,
 } from '@sudowealth/schwab-api'
-import { DurableMCP } from 'workers-mcp'
+import { McpAgent } from 'agents/mcp'
 import { type ValidatedEnv } from '../types/env'
 import { SchwabHandler, initializeSchwabAuthClient } from './auth'
 import { getConfig } from './config'
@@ -38,7 +38,7 @@ type MyMCPProps = {
 	clientId?: string
 }
 
-export class MyMCP extends DurableMCP<MyMCPProps, Env> {
+export class MyMCP extends McpAgent<Env, unknown, MyMCPProps> {
 	private tokenManager!: EnhancedTokenManager
 	private client!: SchwabApiClient
 	private validatedConfig!: ValidatedEnv
@@ -80,14 +80,16 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 			const kvToken = makeKvTokenStore(this.validatedConfig.OAUTH_KV)
 
 			// Ensure clientId is stored in props for token key derivation
-			if (!this.props.clientId) {
-				this.props.clientId = this.validatedConfig.SCHWAB_CLIENT_ID
-				this.props = { ...this.props }
+			if (!this.props?.clientId) {
+				this.props = {
+					...this.props,
+					clientId: this.validatedConfig.SCHWAB_CLIENT_ID,
+				}
 			}
 
 			const getTokenIds = (): TokenIdentifiers => ({
-				schwabUserId: this.props.schwabUserId,
-				clientId: this.props.clientId,
+				schwabUserId: this.props?.schwabUserId,
+				clientId: this.props?.clientId,
 			})
 
 			// Debug token IDs during initialization
@@ -96,8 +98,8 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 				'debug',
 				'[MyMCP.init] Token identifiers',
 				{
-					hasSchwabUserId: !!this.props.schwabUserId,
-					hasClientId: !!this.props.clientId,
+					hasSchwabUserId: !!this.props?.schwabUserId,
+					hasClientId: !!this.props?.clientId,
 					expectedKeyPrefix: sanitizeKeyForLog(kvToken.kvKey(getTokenIds())),
 				},
 			)
@@ -169,7 +171,7 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 			)
 
 			// 2.5. Auto-migrate tokens if we have schwabUserId but token was loaded from clientId key
-			if (this.props.schwabUserId && this.props.clientId) {
+			if (this.props?.schwabUserId && this.props?.clientId) {
 				await kvToken.migrateIfNeeded(
 					{ clientId: this.props.clientId },
 					{ schwabUserId: this.props.schwabUserId },
@@ -228,110 +230,11 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 			throw error // Re-throw to ensure DO framework sees the failure
 		}
 	}
-
-	async onReconnect() {
-		this.mcpLogger.info('Handling reconnection in MyMCP instance')
-		try {
-			if (!this.tokenManager) {
-				this.mcpLogger.warn(
-					'Token manager not initialized, attempting full initialization',
-				)
-				await this.init()
-				return true
-			}
-			this.mcpLogger.info('Attempting reconnection via token manager')
-
-			try {
-				this.mcpLogger.info('Attempting to fetch access token as recovery test')
-				const token = await this.tokenManager.getAccessToken()
-				if (token) {
-					this.mcpLogger.info(
-						'Successfully retrieved access token during reconnection',
-					)
-					return true
-				}
-			} catch (tokenError) {
-				this.mcpLogger.warn('Failed to get access token during reconnection', {
-					error:
-						tokenError instanceof Error
-							? tokenError.message
-							: String(tokenError),
-				})
-			}
-
-			try {
-				this.mcpLogger.info(
-					'Attempting proactive reinitialization of token manager',
-				)
-				const initResult = await this.tokenManager.initialize()
-				this.mcpLogger.info(
-					`Token manager reinitialization ${initResult ? 'succeeded' : 'failed'}`,
-				)
-				if (initResult) {
-					return true
-				}
-			} catch (initError) {
-				this.mcpLogger.warn('Token manager reinitialization failed', {
-					error:
-						initError instanceof Error ? initError.message : String(initError),
-				})
-			}
-
-			try {
-				this.mcpLogger.info('Token manager state during reconnection', {
-					hasTokenManager: !!this.tokenManager,
-				})
-			} catch (stateError) {
-				this.mcpLogger.warn(
-					'Failed to check token manager state during reconnection',
-					{
-						error:
-							stateError instanceof Error
-								? stateError.message
-								: String(stateError),
-					},
-				)
-			}
-
-			this.mcpLogger.warn(
-				'Reconnection recovery attempts failed, performing full reinitialization',
-			)
-			await this.init()
-			return true
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error)
-			const stack = error instanceof Error ? error.stack : undefined
-			this.mcpLogger.error('Critical error during reconnection handling', {
-				error: message,
-				stack,
-			})
-			try {
-				this.mcpLogger.warn(
-					'Attempting emergency reinitialization after reconnection failure',
-				)
-				await this.init()
-				return true
-			} catch (initError) {
-				const initMessage =
-					initError instanceof Error ? initError.message : String(initError)
-				this.mcpLogger.error('Emergency reinitialization also failed', {
-					error: initMessage,
-				})
-				return false
-			}
-		}
-	}
-
-	async onSSE(event: any) {
-		this.mcpLogger.info('SSE connection established or reconnected')
-		await this.onReconnect()
-		return await super.onSSE(event)
-	}
 }
 
 export default new OAuthProvider({
-	apiRoute: API_ENDPOINTS.SSE,
-	apiHandler: MyMCP.mount(API_ENDPOINTS.SSE) as any, // Cast remains due to library typing
+	apiRoute: API_ENDPOINTS.MCP,
+	apiHandler: MyMCP.serve(API_ENDPOINTS.MCP, { binding: 'MCP_OBJECT' }) as any, // Cast remains due to library typing
 	defaultHandler: SchwabHandler as any, // Cast remains
 	authorizeEndpoint: API_ENDPOINTS.AUTHORIZE,
 	tokenEndpoint: API_ENDPOINTS.TOKEN,
