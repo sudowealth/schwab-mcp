@@ -163,7 +163,7 @@ Test your deployment using the MCP Inspector:
 npx @modelcontextprotocol/inspector@latest
 ```
 
-Enter `https://schwab-mcp.<your-subdomain>.workers.dev/sse` and connect. You'll
+Enter `https://schwab-mcp.<your-subdomain>.workers.dev/mcp` and connect. You'll
 be prompted to authenticate with Schwab.
 
 ## Usage
@@ -178,7 +178,7 @@ be prompted to authenticate with Schwab.
 3. Click on the "Add Custom Integration" button
 4. Enter the integration name "Schwab"
 5. Enter the MCP Server URL:
-   `https://schwab-mcp.<your-subdomain>.workers.dev/sse`
+   `https://schwab-mcp.<your-subdomain>.workers.dev/mcp`
 6. Click on the "Add" button
 7. Click "Connect" and the Schwab Authentication flow will start.
 
@@ -193,7 +193,7 @@ Add the following to your Claude Desktop configuration file:
 			"command": "npx",
 			"args": [
 				"mcp-remote",
-				"https://schwab-mcp.<your-subdomain>.workers.dev/sse"
+				"https://schwab-mcp.<your-subdomain>.workers.dev/mcp"
 			]
 		}
 	}
@@ -232,7 +232,7 @@ npm run dev
 # Server will be available at http://localhost:8788
 ```
 
-Connect to `http://localhost:8788/sse` using the MCP Inspector for testing.
+Connect to `http://localhost:8788/mcp` using the MCP Inspector for testing.
 
 ## Architecture
 

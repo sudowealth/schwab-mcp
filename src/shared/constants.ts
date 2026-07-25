@@ -36,6 +36,7 @@ export const LOGGER_CONTEXTS = {
  */
 export const API_ENDPOINTS = {
 	SSE: '/sse',
+	MCP: '/mcp',
 	AUTHORIZE: '/authorize',
 	TOKEN: '/token',
 	CALLBACK: '/callback',
