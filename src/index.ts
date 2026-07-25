@@ -8,6 +8,7 @@ import {
 	type SchwabApiLogger,
 	type TokenData,
 } from '@sudowealth/schwab-api'
+import { type Connection, type ConnectionContext } from 'agents'
 import { McpAgent } from 'agents/mcp'
 import { type ValidatedEnv } from '../types/env'
 import { SchwabHandler, initializeSchwabAuthClient } from './auth'
@@ -230,11 +231,33 @@ export class MyMCP extends McpAgent<Env, unknown, MyMCPProps> {
 			throw error // Re-throw to ensure DO framework sees the failure
 		}
 	}
+
+	async onConnect(conn: Connection, { request: req }: ConnectionContext ) {
+		if (this.getTransportType() === 'sse' && this.tokenManager) {
+				try {
+						const stillValid = await this.tokenManager.initialize()
+						if (!stillValid) {
+								this.mcpLogger.warn(
+										'[MyMCP.onConnect] Token invalid on SSE reconnect, forcing full reinit',
+								)
+								await this.init()
+						}
+				} catch (error) {
+						this.mcpLogger.error(
+								'[MyMCP.onConnect] Token recovery check failed on SSE reconnect',
+								{ error: error instanceof Error ? error.message : String(error) },
+						)
+				}
+		}
+		return super.onConnect(conn, { request: req })
+	}
 }
 
 export default new OAuthProvider({
-	apiRoute: API_ENDPOINTS.MCP,
-	apiHandler: MyMCP.serve(API_ENDPOINTS.MCP, { binding: 'MCP_OBJECT' }) as any, // Cast remains due to library typing
+	apiHandlers: {
+		[API_ENDPOINTS.SSE]: MyMCP.serveSSE(API_ENDPOINTS.SSE, { binding: 'MCP_OBJECT' }) as any,
+		[API_ENDPOINTS.MCP]: MyMCP.serve(API_ENDPOINTS.MCP, { binding: 'MCP_OBJECT' }) as any
+	},
 	defaultHandler: SchwabHandler as any, // Cast remains
 	authorizeEndpoint: API_ENDPOINTS.AUTHORIZE,
 	tokenEndpoint: API_ENDPOINTS.TOKEN,
