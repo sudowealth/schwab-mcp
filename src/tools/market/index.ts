@@ -13,6 +13,8 @@ import {
 import { logger } from '../../shared/log'
 import { createToolSpec } from '../types'
 
+const SCHWAB_API_BASE_URL = 'https://api.schwabapi.com'
+
 export const toolSpecs = [
 	createToolSpec({
 		name: 'getQuotes',
@@ -104,10 +106,43 @@ export const toolSpecs = [
 		name: 'getOptionChain',
 		description: 'Get option chain for an optionable symbol',
 		schema: GetOptionChainParams,
-		call: (c, p) =>
-			c.marketData.options.getOptionChain({
-				queryParams: { symbol: p.symbol },
-			}),
+		// The SDK's response schema rejects real Schwab responses (e.g. `underlying`
+		// and `optionDeliverablesList[].currencyType` come back as null), so we call
+		// the endpoint directly and return the JSON as-is.
+		call: async (_c, p, ctx) => {
+			const token = await ctx.getAccessToken()
+			if (!token) {
+				throw new Error(
+					'No Schwab access token available. Re-authorize the connector.',
+				)
+			}
+
+			const url = new URL(`${SCHWAB_API_BASE_URL}/marketdata/v1/chains`)
+			// Forward all filters (strikeCount, contractType, fromDate, toDate,
+			// range, expMonth, ...) so callers can narrow the chain.
+			for (const [key, value] of Object.entries(p)) {
+				if (value !== undefined && value !== null) {
+					url.searchParams.set(key, String(value))
+				}
+			}
+
+			logger.info('[getOptionChain] Fetching option chain', {
+				params: Object.fromEntries(url.searchParams),
+			})
+			const response = await fetch(url, {
+				headers: {
+					Authorization: `Bearer ${token}`,
+					Accept: 'application/json',
+				},
+			})
+			if (!response.ok) {
+				const body = (await response.text()).slice(0, 500)
+				throw new Error(
+					`Schwab option chain request failed (${response.status}): ${body}`,
+				)
+			}
+			return response.json()
+		},
 	}),
 	createToolSpec({
 		name: 'getOptionExpirationChain',
