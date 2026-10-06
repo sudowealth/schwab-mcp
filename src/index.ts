@@ -201,7 +201,9 @@ export class MyMCP extends DurableMCP<MyMCPProps, Env> {
 					schema: spec.schema,
 					handler: async (params, c) => {
 						try {
-							const data = await spec.call(c, params)
+							const data = await spec.call(c, params, {
+								getAccessToken: () => this.tokenManager.getAccessToken(),
+							})
 							return toolSuccess({
 								data,
 								source: spec.name,
@@ -335,4 +337,6 @@ export default new OAuthProvider({
 	defaultHandler: SchwabHandler as any, // Cast remains
 	authorizeEndpoint: API_ENDPOINTS.AUTHORIZE,
 	tokenEndpoint: API_ENDPOINTS.TOKEN,
+	// Required by MCP clients (Claude, mcp-remote) for OAuth discovery
+	clientRegistrationEndpoint: API_ENDPOINTS.REGISTER,
 })

@@ -101,7 +101,7 @@ npm install
 npx wrangler login
 
 # Create KV namespace for OAuth token storage
-npx wrangler kv:namespace create "OAUTH_KV"
+npx wrangler kv namespace create "OAUTH_KV"
 # Note the ID from the output - you'll need it for configuration
 
 # Set up your personal configuration
@@ -319,7 +319,7 @@ MIT
 1. **"KV namespace not found" error**
 
    - Ensure you created the KV namespace and updated `wrangler.jsonc`
-   - Run `npx wrangler kv:namespace list` to verify
+   - Run `npx wrangler kv namespace list` to verify
 
 2. **Authentication failures**
 
@@ -336,7 +336,7 @@ MIT
    - The server automatically refreshes tokens 5 minutes before expiration
    - Tokens are migrated from clientId to schwabUserId keys automatically
    - Check KV namespace for stored tokens:
-     `npx wrangler kv:key list --namespace-id=<your-id>`
+     `npx wrangler kv key list --namespace-id=<your-id>`
 
 ## Recent Updates
 
